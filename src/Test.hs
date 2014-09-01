@@ -1,11 +1,13 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE QuasiQuotes #-}
+
 module Main where
 
 import           Codec.Picture.Repa
 import qualified Data.Array.Repa.Stencil as R
-import qualified Data.Array.Repa.Stencil.Dim2 as R
+import           Data.Array.Repa.Stencil.Dim2
 import qualified Data.Array.Repa as R
 import           Data.Array.Repa (Z(..), Array, (:.)(..), traverse, DIM1, DIM2, DIM3, D, delay, computeS)
 import qualified Data.Vector.Unboxed as V
@@ -16,6 +18,7 @@ import           System.Environment (getArgs)
 import           System.FilePath ((<.>))
 import qualified Data.ByteString.Lazy as B
 import           Control.Monad.ST
+import           Control.Monad
 
 import Debug.Trace
 
@@ -26,24 +29,38 @@ run :: FilePath -> IO ()
 run fp = do
     eimg <- readImage fp
     img  <- either (error "Unable to load the image") return eimg
-    let resultImage = imgToImage (morph img)
-    B.writeFile (fp <.> "out" <.> "png" ) (imageToPng resultImage)
+    let resultImages = map imgToImage (morph img)
+    zipWithM_ (\n i -> B.writeFile (fp <.> ("out" ++ show n) <.> "png" ) i) [1..] (map imageToPng resultImages)
 
 red,green,blue,alpha :: Int
-red   = 3
-blue  = 2
+red   = 0
 green = 1
-alpha = 0
+blue  = 2
+alpha = 3
 
 type Morph dim = Array D dim Word8 -> Array D dim Word8
+type MorphU dim = Array R.U dim Word8 -> Array R.U dim Word8
 type Convert dimA dimB = Array D dimA Word8 -> Array D dimB Word8
 
 imgArray :: Img RGBA -> Array D DIM3 Word8
 imgArray = delay . imgData
 
-morph :: Img RGBA -> Img RGBA
+morph :: Img RGBA -> [Img RGBA]
 morph orig =
-    (computeS . grayscaleToRGBA . {- topHat 5 . threshold 100 . -} filterBy subRed (imgArray orig) . filterBy subGreen (imgArray orig) . otsu . equalizeImage . grayscale . delay) `onImg` orig
+    let img = delay (imgData orig)
+        force = delay . R.computeUnboxedS
+        g = force $ grayscale img
+        o = force $ otsu g
+        -- l = force $ maskBy3 (\lk _ idx -> letterColor lk idx) 0 img o
+        t = topHat o
+        s = force $ scw g -- $ {- channel blue -} force $ maskBy3 (\lk _ idx -> letterColor lk idx) 0 img g
+        d = dilation5_3 (force $ otsu (invert s))
+        a = force $ imgAnd t d
+        finish = Img . R.computeS . grayscaleToRGBA
+    in map finish [g, o, t, s, d, a] -- R.computeS (grayscaleToRGBA a)
+
+imgAnd :: Array D DIM2 Word8 -> Array D DIM2 Word8 -> Array D DIM2 Word8
+imgAnd x y = R.traverse2 x y const (\l0 l1 idx -> if l0 idx /= 0 && l1 idx /= 0 then 255 else 0)
 
 subGreen :: (DIM3 -> Word8) -> (DIM2 -> Word8) -> DIM2 -> Word8
 subGreen lk0 lk1 sh@(Z :. _y :. _x)
@@ -57,44 +74,154 @@ maxGreen lk0 lk1 sh@(Z :. _y :. _x)
 
 subRed :: (DIM3 -> Word8) -> (DIM2 -> Word8) -> DIM2 -> Word8
 subRed lk0 lk1 sh@(Z :. _y :. _x)
-   | lk0 (sh :. alpha) > lk0 (sh :. blue) = 0
-   | otherwise                          = lk1 sh
+   | lk0 (sh :. red) > lk0 (sh :. blue) = 0
+   | otherwise                            = lk1 sh
 
 maxRed :: (DIM3 -> Word8) -> (DIM2 -> Word8) -> DIM2 -> Word8
 maxRed lk0 lk1 sh@(Z :. _y :. _x)
-   | lk0 (sh :. alpha) > lk0 (sh :. blue) = 255
+   | lk0 (sh :. red) > lk0 (sh :. blue) = 255
    | otherwise                          = lk1 sh
 
-filterBy :: ((DIM3 -> Word8)->  (DIM2 -> Word8) -> DIM2 -> Word8) -> Array D DIM3 Word8 -> Morph DIM2
-filterBy f orig x = R.traverse2 orig x (\_ s -> s) f
+letterColor :: (DIM3 -> Word8) -> DIM2 -> Bool
+letterColor lk0 sh =
+   (g <= 0x40 &&
+     r <= 0x28 &&
+     b >= 0x32) ||
+   (g <= 0x75 &&
+     r <= 0x59 &&
+     b >= 0x51)
+     where
+       g = lk0 (sh :. green)
+       r = lk0 (sh :. red)
+       b = lk0 (sh :. blue)
+{-# INLINE letterColor #-}
+
+maskBy :: ((DIM3 -> Word8)->  (DIM2 -> Word8) -> DIM2 -> Bool) -> Word8 -> Array D DIM3 Word8 -> Morph DIM2
+maskBy f def orig x = R.traverse2 orig x (\_ s -> s) (\l0 l1 idx -> if f l0 l1 idx then l1 idx else def)
+
+maskBy3 :: R.Shape dim => ((DIM3 -> Word8)-> (dim -> Word8) -> dim -> Bool) -> Word8 -> Array D DIM3 Word8 -> Morph dim
+maskBy3 f def orig x = R.traverse2 orig x (\_ s -> s) (\l0 l1 idx -> if f l0 l1 idx then l1 idx else def)
+{-# INLINE maskBy3 #-}
+
+invert :: Morph DIM2
+invert = R.map (\x -> if x == 0 then 255 else 0)
+
+scw :: Morph DIM2
+scw orig =
+    let Z :. width :. height = R.extent orig
+        img      = R.computeUnboxedS (R.map fromIntegral orig :: Array R.D DIM2 Double)
+        box16_8  = R.computeUnboxedS $ R.traverse img id (\l0 idx@(Z :. x :. y) -> if x >= 8 && (width - x) > 8 && y >= 4 && (height - y) > 4
+                                                           then sum [ l0 (Z :. i :. j) | i <- [x-8..x+8], j <- [y-4..y+4]]
+                                                           else l0 idx)
+        box48_16 = R.computeUnboxedS $ R.traverse img id (\l0 idx@(Z :. x :. y) -> if x >= 24 && (width - x) > 24 && y >= 8 && (height - y) > 8
+                                                           then sum [ l0 (Z :. i :. j) | i <- [x-16..x+16], j <- [y-8..y+8]]
+                                                           else l0 idx)
+    in R.traverse3 orig box16_8 box48_16 (\s _ _ -> s) (\l0 l1 l2 idx -> let r = (l2 idx / (48*16)) / (l1 idx / (16*8)) in if r < scwMean then 0 else l0 idx)
+
+scwMean :: Double
+scwMean = 0.7
 
 -- Minimum value from a neighborhood
 --
 -- NOTE: i must be less than 16!
-erosion :: Int -> Morph DIM2
-erosion i a =
-    let s = R.makeStencil2 i i (Just . const 1) -- Max value == 255 * i * i == 231
-        f lk idx = if lk idx == 0 then 0 else 255
-    in R.traverse (R.mapStencil2 R.BoundClamp s a) id f
+-- erosion :: Int -> Morph DIM2
+erosion3_3 a =
+    let s = [stencil2| 1 1 1
+                       1 1 1
+                       1 1 1 |] -- R.makeStencil (Z :. i :. i) (Just . const 1) -- Max value == 255 * i * i == 231
+        f v = if v /= 3*3*255 then 0 else 255
+    in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a)
+
+erosion5_5 a =
+    let s = [stencil2| 1 1 1 1 1
+                       1 1 1 1 1
+                       1 1 1 1 1
+                       1 1 1 1 1
+                       1 1 1 1 1|] -- R.makeStencil (Z :. i :. i) (Just . const 1) -- Max value == 255 * i * i == 231
+        f v = if v /= 5*5*255 then 0 else 255
+    in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a)
+
+erosion7_7 a =
+    let s = [stencil2| 1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1|] -- R.makeStencil (Z :. i :. i) (Just . const 1) -- Max value == 255 * i * i == 231
+        f v = if v /= 7*7*255 then 0 else 255
+    in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a)
 
 -- Maximum value from a neighborhood
-dilation :: Int -> Morph DIM2
-dilation i a =
-    let s = R.makeStencil2 i i (Just . const 1)
+dilation3_3 :: Morph DIM2
+dilation3_3 a =
+    let s = [stencil2| 1 1 1
+                       1 1 1
+                       1 1 1 |]
+        f v = if v /= 0 then 255 else 0
+    in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a) -- (const $ R.extent a) f
+
+dilation5_3 :: Morph DIM2
+dilation5_3 a =
+    let s = [stencil2| 1 1 1 1 1
+                       1 1 1 1 1
+                       1 1 1 1 1|]
+        f v = if v /= 0 then 255 else 0
+    in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a) -- (const $ R.extent a) f
+
+dilation5_5 :: Morph DIM2
+dilation5_5 a =
+    let s = [stencil2| 1 1 1 1 1
+                       1 1 1 1 1
+                       1 1 1 1 1
+                       1 1 1 1 1
+                       1 1 1 1 1|]
+        f v = if v /= 0 then 255 else 0
+    in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a) -- (const $ R.extent a) f
+
+dilation7_7 :: Morph DIM2
+dilation7_7 a =
+    let s = [stencil2| 1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1
+                       1 1 1 1 1 1 1|]
+        f v = if v /= 0 then 255 else 0
+    in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a) -- (const $ R.extent a) f
+
+openning :: Morph DIM2
+openning = dilation7_7 . erosion7_7
+
+-- smallOpenning = smallDilation . smallErosion
+
+smallErosion a =
+    let s = [stencil2| 1 1
+                       1 1 |] -- R.makeStencil (Z :. i :. i) (Just . const 1) -- Max value == 255 * i * i == 231
+        f lk idx = if lk idx /= 9*255 then 0 else 255
+    in R.traverse (mapStencil2 (R.BoundConst 0) s a) (const $ R.extent a) f
+
+-- Maximum value from a neighborhood
+-- dilation :: Int -> Morph DIM2
+smallDilation a =
+    let s = [stencil2| 1 1
+                       1 1 |] -- makeStencil2 3 3 (Just . const 1)
         f lk idx = if lk idx /= 0 then 255 else 0
-    in R.traverse (R.mapStencil2 R.BoundClamp s a) id f
+    in R.traverse (mapStencil2 (R.BoundConst 0) s a) (const $ R.extent a) f
 
-openning :: Int -> Morph DIM2
-openning i = dilation i . erosion i
+-- closing :: Int -> Morph DIM2
+-- closing = erosion . dilation
 
-closing :: Int -> Morph DIM2
-closing i = erosion i . dilation i
+-- smallClosing = smallErosion . smallDilation
 
-topHat :: Int -> Morph DIM2
-topHat i a = a R.-^ openning i a
+topHat :: Morph DIM2
+topHat a = a R.-^ openning a
 
-bottomHat :: Int -> Morph DIM2
-bottomHat i a = closing i a R.-^ a
+-- bottomHat :: Int -> Morph DIM2
+-- bottomHat i a
+--     | i == (2::Int) = smallClosing a R.-^ a
+--     | otherwise     = closing a R.-^ a
 
 otsuLevel :: Array D DIM2 Word8 -> Word8
 otsuLevel arr =
@@ -109,14 +236,7 @@ otsuLevel arr =
         mB   = V.zipWith (\n d -> if d == 0 then 1 else fromIntegral n / fromIntegral d :: Double) sumB wB
         mF   = V.zipWith (\b f -> if f == 0 then 1 else (sm - fromIntegral b) / fromIntegral f) sumB wF
         between = V.zipWith4 (\x y b f -> fromIntegral x * fromIntegral y * (b-f)^2) wB wF mB mF
-        max2 v  = max2L (zip (V.toList v) [0..]) ((0,0),(0,0))
-        max2L :: [(Double,Int)] -> ((Double,Int),(Double,Int)) -> (Int,Int)
-        max2L [] (a,b) = (snd a, snd b)
-        max2L (x:xs) !acc@(!a,!b)
-            | x <= b    = max2L xs acc
-            | x > a     = max2L xs (x,a)
-            | otherwise = max2L xs (a,x)
-    in snd $ V.maximum (V.zip between (V.fromList [0..255])) -- fromIntegral $ uncurry (+) (max2 between) `div` 2
+    in snd $ V.maximum (V.zip between (V.fromList [0..255]))
 
 otsu :: Morph DIM2
 otsu arr =
@@ -131,24 +251,19 @@ grayscaleToRGBA a = R.traverse a (\(Z :. y :. x) -> Z :. y :. x :. four) expandC
     | chan == 0 = 255
     | otherwise = lk (Z :. y :. x)
 
--- 3 == r
--- 2 == b
--- 1 == g
 grayscale :: Convert DIM3 DIM2
 grayscale a = traverse a (\(Z :. y :. x :. _) -> Z :. y :. x) f
   where
-  f lk (Z :. y :. x) =
-        let r = fromIntegral $ lk (Z :. y :. x :. 3) :: Double
-            b = fromIntegral $ lk (Z :. y :. x :. 2)
-            g = fromIntegral $ lk (Z :. y :. x :. 1)
+  f lk sh =
+        let r = fromIntegral $ lk (sh :. red) :: Double
+            b = fromIntegral $ lk (sh :. blue)
+            g = fromIntegral $ lk (sh :. green)
         in floor (0.2126 * r + 0.7152 * g + 0.0722 * b)
 
 threshold :: Word8 -> Morph DIM2
 threshold w a = R.traverse a id f
  where
  f lk (Z :. y :. x) =
-   -- | color == 0 = 255
-   -- | otherwise = 
         let v = lk (Z :. y :. x)
         in if v <= w then 255 else 0
 
@@ -166,6 +281,8 @@ equalizedHistogram img = R.delay $ R.fromUnboxed (Z :. 256) $ V.generate 256 f
   cumu    = cumulative (histogram img)
   f i     = floor $ 255 * ((fromIntegral $ (cumu `R.index` (Z :. i)) - mn :: Double) / (fromIntegral $ y*x - mn))
 
+-- Cumulative distribution function (given a histogram, compute the
+-- percentage of each grayscale value)
 cdf :: Array D DIM1 Int -> Array D DIM1 Double
 cdf hist =
    let histV          = R.toUnboxed (R.computeUnboxedS hist)
@@ -197,3 +314,8 @@ histogram r =
 -- deriviative :: Image a -> Image a
 -- derivative = onImg $ \arr ->
     
+
+channel :: Int -> Convert DIM3 DIM2
+channel c i =
+    let f lk idx = lk (idx :. c)
+    in R.traverse i (\(Z :. x :. y :. _) -> Z :. x :. y) f
