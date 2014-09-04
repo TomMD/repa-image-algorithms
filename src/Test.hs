@@ -53,8 +53,8 @@ morph orig =
         o = force $ otsu g
         -- l = force $ maskBy3 (\lk _ idx -> letterColor lk idx) 0 img o
         t = topHat o
-        s = force $ scw g -- $ {- channel blue -} force $ maskBy3 (\lk _ idx -> letterColor lk idx) 0 img g
-        d = dilation5_3 (force $ otsu (invert s))
+        s = force $ scw defaultScwMean (18, 6) (48, 16) g
+        d = dilation7_7 (force $ otsu (invert s))
         a = force $ imgAnd t d
         finish = Img . R.computeS . grayscaleToRGBA
     in map finish [g, o, t, s, d, a] -- R.computeS (grayscaleToRGBA a)
@@ -106,25 +106,36 @@ maskBy3 f def orig x = R.traverse2 orig x (\_ s -> s) (\l0 l1 idx -> if f l0 l1 
 invert :: Morph DIM2
 invert = R.map (\x -> if x == 0 then 255 else 0)
 
-scw :: Morph DIM2
-scw orig =
-    let Z :. width :. height = R.extent orig
-        img      = R.computeUnboxedS (R.map fromIntegral orig :: Array R.D DIM2 Double)
-        box16_8  = R.computeUnboxedS $ R.traverse img id (\l0 idx@(Z :. x :. y) -> if x >= 8 && (width - x) > 8 && y >= 4 && (height - y) > 4
-                                                           then sum [ l0 (Z :. i :. j) | i <- [x-8..x+8], j <- [y-4..y+4]]
-                                                           else l0 idx)
-        box48_16 = R.computeUnboxedS $ R.traverse img id (\l0 idx@(Z :. x :. y) -> if x >= 24 && (width - x) > 24 && y >= 8 && (height - y) > 8
-                                                           then sum [ l0 (Z :. i :. j) | i <- [x-16..x+16], j <- [y-8..y+8]]
-                                                           else l0 idx)
-    in R.traverse3 orig box16_8 box48_16 (\s _ _ -> s) (\l0 l1 l2 idx -> let r = (l2 idx / (48*16)) / (l1 idx / (16*8)) in if r < scwMean then 0 else l0 idx)
+defaultScwMean :: Double
+defaultScwMean = 0.95
 
-scwMean :: Double
-scwMean = 0.7
+scw :: Double -> (Int,Int) -> (Int,Int) -> Morph DIM2
+scw scwMean small large orig =
+    let mkBox sz = R.computeUnboxedS $ (uncurry scwGeneric) sz orig
+        boxSmall = mkBox small
+        boxLarge = mkBox large
+        lg = fromIntegral $ fst large * snd large
+        sm = fromIntegral $ fst small * snd small
+    in R.traverse3 orig boxSmall boxLarge
+                   (\s _ _ -> s)
+                   (\l0 l1 l2 idx -> let r = (l2 idx / lg) / (l1 idx / sm) in if r < scwMean then 0 else l0 idx)
+
+scwGeneric :: Int -> Int -> Array D DIM2 Word8 -> Array D DIM2 Double
+scwGeneric xDelta yDelta = \orig ->
+    let img = R.computeUnboxedS (R.map fromIntegral orig :: Array R.D DIM2 Double)
+        Z :. width :. height = R.extent orig
+        (xh,yh) = (xDelta `div` 2, yDelta `div` 2)
+    in R.traverse img id (\l0 idx@(Z :. x :. y) -> if x >= xh && (width - x) > xh &&
+                                                      y >= yh && (height - y) > yh
+                                                       then sum [ l0 (Z :. i :. j) | i <- [x - xh .. x + xh]
+                                                                                   , j <- [y - yh .. y + yh] ]
+                                                       else l0 idx)
+{-# INLINE scwGeneric #-}
 
 -- Minimum value from a neighborhood
 --
 -- NOTE: i must be less than 16!
--- erosion :: Int -> Morph DIM2
+erosion3_3 :: Morph DIM2
 erosion3_3 a =
     let s = [stencil2| 1 1 1
                        1 1 1
@@ -141,6 +152,7 @@ erosion5_5 a =
         f v = if v /= 5*5*255 then 0 else 255
     in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a)
 
+erosion7_7 :: Morph DIM2
 erosion7_7 a =
     let s = [stencil2| 1 1 1 1 1 1 1
                        1 1 1 1 1 1 1
@@ -192,7 +204,7 @@ dilation7_7 a =
     in R.map f (R.computeUnboxedS $ mapStencil2 (R.BoundConst 0) s a) -- (const $ R.extent a) f
 
 openning :: Morph DIM2
-openning = dilation7_7 . erosion7_7
+openning = dilation7_7 . dilation3_3 . erosion3_3 . erosion7_7
 
 -- smallOpenning = smallDilation . smallErosion
 
